@@ -1,0 +1,55 @@
+#!/bin/bash
+set -euo pipefail
+
+# === CONFIGURAZIONE LOG ===
+LOG_FILE="/var/log/lvm_setup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+timestamp() {
+    date "+%Y-%m-%d %H:%M:%S"
+}
+
+log() {
+    echo "[$(timestamp)] $*"
+}
+
+# === CONFIGURAZIONE DISCO E LVM ===
+DISK="/dev/sdX"        # Disco da usare
+VG_NAME="vg_data"      # Nome Volume Group
+LV_NAME="lv_data"      # Nome Logical Volume
+LV_SIZE="100%FREE"     # Dimensione LV (es. 50G o 100%FREE)
+FS_TYPE="ext4"         # Tipo filesystem (ext4, xfs, ecc.)
+MOUNT_POINT="/mnt/data"
+
+# === CREAZIONE PARTIZIONE LVM ===
+log ">> Creazione partizione LVM su $DISK"
+echo -e "n\n\n\n\n\nt\n8e\nw" | fdisk "$DISK"
+
+log ">> Aggiornamento tabella partizioni"
+partprobe "$DISK"
+
+# Trova la partizione appena creata
+PART=$(lsblk -nr "$DISK" | tail -1 | awk '{print "/dev/" $1}')
+[ -b "$PART" ] || { log "❌ Errore: partizione non trovata"; exit 1; }
+
+# === LVM: PV, VG, LV ===
+log ">> Inizializzo LVM su $PART"
+pvcreate "$PART"
+vgcreate "$VG_NAME" "$PART"
+lvcreate -n "$LV_NAME" -l "$LV_SIZE" "$VG_NAME"
+
+# === FORMATTAZIONE ===
+log ">> Formatto $VG_NAME/$LV_NAME come $FS_TYPE"
+mkfs."$FS_TYPE" "/dev/$VG_NAME/$LV_NAME"
+
+# === MONTAGGIO ===
+log ">> Creo mount point e monto volume"
+mkdir -p "$MOUNT_POINT"
+mount "/dev/$VG_NAME/$LV_NAME" "$MOUNT_POINT"
+
+# === FSTAB ===
+UUID=$(blkid -s UUID -o value "/dev/$VG_NAME/$LV_NAME")
+echo "UUID=$UUID  $MOUNT_POINT  $FS_TYPE  defaults  0  2" >> /etc/fstab
+
+log "Volume LVM creato, formattato e montato su $MOUNT_POINT"
+log "Log salvato in $LOG_FILE"
