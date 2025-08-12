@@ -1,0 +1,76 @@
+#!/bin/bash
+set -euo pipefail
+
+# Config
+HOSTS_FILE="hosts.txt"
+LOG_FILE="monitor.log"
+INTERVAL=60  # secondi tra un ciclo e l'altro
+
+# Config email
+MAIL_TO="admin@example.com"
+MAIL_SUBJECT="Alert monitoraggio Bash"
+
+# Config Slack (Webhook URL)
+SLACK_WEBHOOK="https://hooks.slack.com/services/TUO/WEBHOOK/URL"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+alert() {
+    local message="$1"
+    log "ALERT: $message"
+
+    # Notifica email (richiede 'mailutils' o 'sendmail')
+    echo "$message" | mail -s "$MAIL_SUBJECT" "$MAIL_TO"
+
+    # Notifica Slack
+    curl -s -X POST -H 'Content-type: application/json' \
+        --data "{\"text\":\"$message\"}" \
+        "$SLACK_WEBHOOK" >/dev/null
+}
+
+while true; do
+    log "=== Ciclo monitoraggio ==="
+
+    # CPU Usage
+    usage=$(top -bn1 | awk '/Cpu/ {print 100-$8}')
+    log "CPU usage: ${usage}%"
+    [[ ${usage%.*} -ge 90 ]] && alert "CPU alta: ${usage}%"
+
+    # Memoria
+    mem_usage=$(free -m | awk 'NR==2{printf "%.2f", $3*100/$2}')
+    log "Memoria: ${mem_usage}%"
+    [[ ${mem_usage%.*} -ge 90 ]] && alert "Memoria alta: ${mem_usage}%"
+
+    # Disco
+    df -h --output=pcent,target | tail -n +2 | while read perc mount; do
+        perc_num=${perc%\%}
+        if [[ $perc_num -ge 90 ]]; then
+            alert "Disco $mount al $perc"
+        else
+            log "Disco: $mount al $perc"
+        fi
+    done
+
+    # Load average
+    load=$(uptime | awk -F'load average:' '{ print $2 }' | sed 's/^ //')
+    log "Load Average: $load"
+
+    # Ping host
+    if [[ -f "$HOSTS_FILE" ]]; then
+        while read -r host; do
+            [[ -z "$host" ]] && continue
+            if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+                log "Host $host OK"
+            else
+                alert "Host $host DOWN"
+            fi
+        done < "$HOSTS_FILE"
+    else
+        log "Nessun file $HOSTS_FILE trovato"
+    fi
+
+    log "=== Fine ciclo ==="
+    sleep "$INTERVAL"
+done
