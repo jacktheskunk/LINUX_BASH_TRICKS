@@ -1,0 +1,69 @@
+#!/bin/bash
+set -euo pipefail
+
+# Config
+LOG_FILE="monitor_services_http.log"
+INTERVAL=60  # secondi tra un ciclo e l'altro
+
+# Config email
+MAIL_TO="admin@example.com"
+MAIL_SUBJECT="Alert servizi/HTTP"
+
+# Config Slack (Webhook URL)
+SLACK_WEBHOOK="https://hooks.slack.com/services/TUO/WEBHOOK/URL"
+
+# Servizi systemd da controllare
+SERVICES=(
+    "nginx"
+    "sshd"
+    "docker"
+)
+
+# URL da controllare
+URLS=(
+    "https://example.com"
+    "https://google.com"
+)
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+alert() {
+    local message="$1"
+    log "ALERT: $message"
+
+    # Email
+    echo "$message" | mail -s "$MAIL_SUBJECT" "$MAIL_TO"
+
+    # Slack
+    curl -s -X POST -H 'Content-type: application/json' \
+        --data "{\"text\":\"$message\"}" \
+        "$SLACK_WEBHOOK" >/dev/null
+}
+
+while true; do
+    log "=== Ciclo monitoraggio ==="
+
+    # Check servizi systemd
+    for svc in "${SERVICES[@]}"; do
+        if systemctl is-active --quiet "$svc"; then
+            log "Servizio $svc: OK"
+        else
+            alert "Servizio $svc: DOWN"
+        fi
+    done
+
+    # Check HTTP
+    for url in "${URLS[@]}"; do
+        http_code=$(curl -o /dev/null -s -w "%{http_code}" "$url" || echo "000")
+        if [[ "$http_code" == "200" ]]; then
+            log "HTTP $url: OK (200)"
+        else
+            alert "HTTP $url: ERRORE (codice $http_code)"
+        fi
+    done
+
+    log "=== Fine ciclo ==="
+    sleep "$INTERVAL"
+done
