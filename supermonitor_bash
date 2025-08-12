@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# super_monitor.sh
+# Mini "Zabbix" in bash: monitor risorse, servizi, HTTP e certificati TLS
+# Log + notifiche via mail e Slack
+
+# ========== CONFIGURAZIONE ==========
+LOG_FILE="super_monitor.log"
+INTERVAL=60                # secondi tra i cicli
+HOSTS_FILE="hosts.txt"     # file con host da pingare (una riga = un host; # commenti)
+CERT_WARN_DAYS=15          # soglia in giorni per warning certificati
+
+# Notifiche
+MAIL_TO="admin@example.com"                 # usa una mail funzionante sul sistema
+MAIL_SUBJECT="[MONITOR] Alert"
+SLACK_WEBHOOK=""                            # inserisci webhook Slack o lascia vuoto per disabilitare
+
+# Servizi e URL da monitorare (editare a piacere)
+SERVICES=( "nginx" "sshd" "docker" )
+URLS=( "https://example.com" "https://google.com" )
+
+# Soglie
+CPU_WARN_PERCENT=90
+MEM_WARN_PERCENT=90
+DISK_WARN_PERCENT=90
+
+# ========== FUNZIONI ==========
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+alert() {
+    local message="$1"
+    log "ALERT: $message"
+
+    # Email (richiede mailutils o sendmail configurato)
+    if command -v mail >/dev/null 2>&1; then
+        echo "$message" | mail -s "$MAIL_SUBJECT" "$MAIL_TO" || log "Warn: invio mail fallito"
+    else
+        log "Info: comando 'mail' non trovato; salto invio email"
+    fi
+
+    # Slack (webhook)
+    if [[ -n "$SLACK_WEBHOOK" ]]; then
+        # escape JSON-ish quotes
+        local payload
+        payload=$(printf '{"text":"%s"}' "$(echo "$message" | sed 's/"/\\"/g')")
+        curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || log "Warn: invio Slack fallito"
+    fi
+}
+
+# Legge hosts dal file ignorando commenti/righe vuote
+read_hosts() {
+    local hosts=()
+    if [[ -f "$HOSTS_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            hosts+=("$line")
+        done < "$HOSTS_FILE"
+    fi
+    echo "${hosts[@]}"
+}
+
+# Estrae host/port da URL (es https://example.com:8443/path -> example.com:8443)
+url_to_hostport() {
+    local url="$1"
+    # rimuove schema
+    local h=${url#*://}
+    # prende fino a primo '/'
+    h=${h%%/*}
+    echo "$h"
+}
+
+# ========== CHECKS ==========
+check_ping_hosts() {
+    local hosts=("$@")
+    for host in "${hosts[@]}"; do
+        if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+            log "PING OK: $host"
+        else
+            alert "PING FAIL: $host"
+        fi
+    done
+}
+
+check_cpu() {
+    # top output locale-sensitive; questa riga funziona nella maggior parte delle distro
+    if cpu_raw=$(top -bn1 2>/dev/null | awk '/Cpu/ {print 100-$8; exit}'); then
+        cpu_raw=${cpu_raw:-0}
+        cpu_int=${cpu_raw%.*}
+        log "CPU usage: ${cpu_raw}%"
+        if (( cpu_int >= CPU_WARN_PERCENT )); then
+            alert "CPU alta: ${cpu_raw}%"
+        fi
+    else
+        log "Impossibile ottenere CPU usage"
+    fi
+}
+
+check_mem() {
+    if mem_line=$(free -m | awk 'NR==2{printf "%.2f %s %s", $3*100/$2, $3, $2}'); then
+        mem_pct=$(echo "$mem_line" | awk '{print $1}')
+        mem_used=$(echo "$mem_line" | awk '{print $2}')
+        mem_total=$(echo "$mem_line" | awk '{print $3}')
+        mem_int=${mem_pct%.*}
+        log "MEMORIA: ${mem_used}MB/${mem_total}MB (${mem_pct}%)"
+        if (( mem_int >= MEM_WARN_PERCENT )); then
+            alert "Memoria alta: ${mem_pct}% (${mem_used}MB/${mem_total}MB)"
+        fi
+    else
+        log "Impossibile ottenere info memoria"
+    fi
+}
+
+check_disk() {
+    # controlla tutte le mount (saltar eventualmente overlay/loop se necessario)
+    while IFS= read -r line; do
+        # line esempio: " 12% /"
+        perc=$(echo "$line" | awk '{print $1}')
+        mountp=$(echo "$line" | awk '{print $2}')
+        perc_num=${perc%\%}
+        log "DISCO: $mountp al $perc"
+        if (( perc_num >= DISK_WARN_PERCENT )); then
+            alert "Disco pieno: $mountp al $perc"
+        fi
+    done < <(df -h --output=pcent,target | tail -n +2)
+}
+
+check_load() {
+    local load
+    load=$(uptime | awk -F'load average:' '{print $2}' | sed 's/^ //')
+    log "LOAD AVERAGE: $load"
+}
+
+check_services() {
+    for svc in "${SERVICES[@]}"; do
+        if systemctl is-active --quiet "$svc"; then
+            log "SERVICE OK: $svc"
+        else
+            alert "SERVICE DOWN: $svc"
+        fi
+    done
+}
+
+check_http() {
+    for url in "${URLS[@]}"; do
+        # timeout breve per evitare blocchi
+        http_code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 10 "$url" || echo "000")
+        if [[ "$http_code" == "200" ]]; then
+            log "HTTP OK: $url (200)"
+        else
+            alert "HTTP FAIL: $url (code: $http_code)"
+        fi
+    done
+}
+
+check_tls_expiry() {
+    for url in "${URLS[@]}"; do
+        hostport=$(url_to_hostport "$url")
+        # separa host e port
+        host="${hostport%%:*}"
+        port="${hostport##*:}"
+        if [[ "$host" == "$port" ]]; then
+            # non c'era port esplicito
+            port=443
+        fi
+
+        # ottieni expiry; timeout con openssl non nativo -> usiamo timeout(1)
+        if ! command -v openssl >/dev/null 2>&1; then
+            log "openssl non disponibile: salto check TLS"
+            return
+        fi
+
+        # prova a leggere il certificato (timeout 10s)
+        enddate=$(timeout 10 bash -c "echo | openssl s_client -servername '$host' -connect '${host}:${port}' 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null" || true)
+        if [[ -z "$enddate" ]]; then
+            alert "TLS: impossibile ottenere certificato per $host:$port"
+            continue
+        fi
+
+        # enddate esempi: "notAfter=Mar 21 12:34:56 2025 GMT"
+        enddate_val=${enddate#notAfter=}
+        if ! expire_epoch=$(date -d "$enddate_val" +%s 2>/dev/null); then
+            log "TLS: formato data non valido per $host:$port -> '$enddate_val'"
+            continue
+        fi
+        now_epoch=$(date +%s)
+        days_left=$(( (expire_epoch - now_epoch) / 86400 ))
+        log "TLS $host:$port scade in ${days_left} giorni (data: $enddate_val)"
+        if (( days_left <= CERT_WARN_DAYS )); then
+            alert "TLS WARNING: $host:$port scade in ${days_left} giorni"
+        fi
+    done
+}
+
+# ========== MAIN LOOP ==========
+log "=== Avvio super_monitor (interval ${INTERVAL}s) ==="
+
+# carica hosts una volta; se vuoi ricaricare dinamicamente ogni ciclo puoi spostare la chiamata dentro il loop
+hosts_arr=()
+if [[ -f "$HOSTS_FILE" ]]; then
+    read -r -a hosts_arr <<< "$(read_hosts)"
+else
+    log "Attenzione: file $HOSTS_FILE non trovato; ping hosts disabilitati"
+fi
+
+while true; do
+    log "=== Nuovo ciclo ==="
+
+    # Ping hosts (se ce ne sono)
+    if (( ${#hosts_arr[@]} > 0 )); then
+        check_ping_hosts "${hosts_arr[@]}"
+    fi
+
+    check_cpu
+    check_mem
+    check_disk
+    check_load
+    check_services
+    check_http
+    check_tls_expiry
+
+    log "=== Fine ciclo; sleeping ${INTERVAL}s ==="
+    sleep "$INTERVAL"
+done
