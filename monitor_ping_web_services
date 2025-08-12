@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_FILE="targets.txt"
+LOG_FILE="monitor.log"
+SLEEP_TIME=60 # secondi tra i cicli
+
+while true; do
+    while read -r target || [[ -n "$target" ]]; do
+        [[ -z "$target" ]] && continue # salta righe vuote
+
+        timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+        if [[ "$target" =~ ^https?:// ]]; then
+            # Check HTTP/HTTPS
+            if curl -Is --max-time 5 "$target" | head -n 1 | grep -q "200\|301\|302"; then
+                echo "$timestamp [HTTP] $target OK" >> "$LOG_FILE"
+            else
+                echo "$timestamp [HTTP] $target DOWN" >> "$LOG_FILE"
+            fi
+
+        elif [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ping -c1 -W1 "$target" &>/dev/null; then
+            # Check Ping
+            if ping -c1 -W1 "$target" &>/dev/null; then
+                echo "$timestamp [PING] $target OK" >> "$LOG_FILE"
+            else
+                echo "$timestamp [PING] $target DOWN" >> "$LOG_FILE"
+            fi
+
+        else
+            # Check Systemd service
+            if systemctl is-active --quiet "$target"; then
+                echo "$timestamp [SERVICE] $target ACTIVE" >> "$LOG_FILE"
+            else
+                echo "$timestamp [SERVICE] $target INACTIVE" >> "$LOG_FILE"
+            fi
+        fi
+
+    done < "$TARGET_FILE"
+
+    sleep "$SLEEP_TIME"
+done
