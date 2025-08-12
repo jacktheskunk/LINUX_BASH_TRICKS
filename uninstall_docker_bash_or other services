@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+#esegui come root
+#qualunque installazione si voglia rimuovere sostituire solo il docker dal grep e pkill e sostiyuire i path
+
+# Trova il numero di transazione di yum che ha installato il servizio (docker as example)
+TXN_NUM=$(yum history list | grep -i install | grep docker | awk '{print $1}' | head -n1)
+
+if [ -z "$TXN_NUM" ]; then
+  echo "Nessuna installazione di Docker trovata nella cronologia yum."
+  exit 1
+fi
+
+echo "Undo yum transaction number: $TXN_NUM"
+
+# Esegue il rollback di quella transazione
+sudo yum history undo -y $TXN_NUM
+
+# Termina tutti i processi docker
+echo "Killing docker processes..."
+sudo pkill -9 dockerd || true
+sudo pkill -9 docker || true
+
+# Rimuove file e directory tipiche di docker
+echo "Removing docker files and directories..."
+sudo rm -rf /var/lib/docker
+sudo rm -rf /etc/docker
+sudo rm -rf /var/run/docker.sock
+sudo rm -rf /usr/bin/docker*
+sudo rm -rf /usr/lib/systemd/system/docker.service
+sudo rm -rf /usr/lib/systemd/system/docker.socket
+sudo systemctl daemon-reload
+
+echo "Docker uninstall and cleanup completed."
