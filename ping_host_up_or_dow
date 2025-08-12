@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+
+# File con la lista degli host da monitorare
+HOST_FILE="./hosts.txt"
+
+# Check che il file esista
+if [[ ! -f "$HOST_FILE" ]]; then
+    echo "❌ File $HOST_FILE non trovato!"
+    exit 1
+fi
+
+# Loop sugli host
+while read -r host; do
+    # Salta righe vuote o commenti
+    [[ -z "$host" || "$host" =~ ^# ]] && continue
+
+    # Esegue il ping
+    if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+        echo "$(date '+%F %T') $host UP"
+    else
+        echo "$(date '+%F %T') $host DOWN"
+    fi
+done < "$HOST_FILE"
