@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+
+HOST_FILE="./hosts.txt"
+LOG_FILE="./ping_monitor.log"
+INTERVAL=30  # secondi tra un controllo e l'altro
+
+# Controllo file host
+if [[ ! -f "$HOST_FILE" ]]; then
+    echo "❌ File $HOST_FILE non trovato!"
+    exit 1
+fi
+
+declare -A STATUS  # mappa host→stato
+
+echo "===== Avvio monitoraggio $(date '+%F %T') =====" | tee -a "$LOG_FILE"
+
+while true; do
+    while read -r host; do
+        [[ -z "$host" || "$host" =~ ^# ]] && continue
+
+        if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+            new_status="UP"
+        else
+            new_status="DOWN"
+        fi
+
+        # Se lo stato è cambiato, loggalo
+        if [[ "${STATUS[$host]:-unknown}" != "$new_status" ]]; then
+            echo "$(date '+%F %T') $host $new_status" | tee -a "$LOG_FILE"
+            STATUS[$host]="$new_status"
+        fi
+    done < "$HOST_FILE"
+
+    sleep "$INTERVAL"
+done
